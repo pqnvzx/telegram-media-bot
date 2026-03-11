@@ -1,11 +1,14 @@
 import asyncio
 import concurrent.futures
+import json
 import logging
 import os
 import shutil
+import subprocess
 import tempfile
+import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import yt_dlp
 
@@ -14,9 +17,7 @@ from config import (
     YTDLP_MAX_WORKERS,
     YTDLP_CONCURRENT_FRAGMENTS,
     FFMPEG_THREADS,
-    SAFE_MODE_2GB,
     LONG_VIDEO_MINUTES,
-    SAFE_LONG_VIDEO_MAX_HEIGHT,
 )
 
 logger = logging.getLogger(__name__)
@@ -24,27 +25,55 @@ logger = logging.getLogger(__name__)
 YTDLP_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=YTDLP_MAX_WORKERS)
 
 
+def cleanup_temp_dir(path: Optional[str]):
+    if not path:
+        return
+
+    # On Windows, active file handles can prevent directory removal.
+    # Retry a few times to give handles a chance to close.
+    for attempt in range(1, 6):
+        try:
+            shutil.rmtree(path)
+            logger.info("Cleaned up temp dir: %s", path)
+            return
+        except Exception as e:
+            if attempt < 5:
+                logger.debug("Retrying cleanup of %s (attempt %s): %s", path, attempt, e)
+                time.sleep(0.1)
+                continue
+            logger.error("Error cleaning temp dir %s: %s", path, e)
+
+
 def normalize_media_url(url: str) -> str:
     url = (url or "").strip()
+
     if url.startswith("ttps://"):
         url = "h" + url
     elif url.startswith("ttp://"):
         url = "h" + url
+    elif url.startswith("tps://"):
+        url = "ht" + url
+    elif url.startswith("ps://"):
+        url = "htt" + url
+    elif url.startswith("://"):
+        url = "https" + url
     elif url.startswith("www."):
         url = "https://" + url
+    elif not url.startswith(("http://", "https://")):
+        if any(x in url for x in ("youtube.com", "youtu.be", "soundcloud.com")):
+            url = "https://" + url
+
     return url
 
 
-
-
-
 def _extract_quality_label(info: Dict[str, Any]) -> str:
-    heights = []
+    heights: List[int] = []
+
     direct_height = info.get("height")
     if isinstance(direct_height, (int, float)) and direct_height > 0:
         heights.append(int(direct_height))
 
-    for key in ("requested_formats", "formats"):
+    for key in ("requested_formats", "formats", "requested_downloads"):
         value = info.get(key)
         if isinstance(value, list):
             for item in value:
@@ -52,14 +81,6 @@ def _extract_quality_label(info: Dict[str, Any]) -> str:
                     h = item.get("height")
                     if isinstance(h, (int, float)) and h > 0:
                         heights.append(int(h))
-
-    requested_downloads = info.get("requested_downloads")
-    if isinstance(requested_downloads, list):
-        for item in requested_downloads:
-            if isinstance(item, dict):
-                h = item.get("height")
-                if isinstance(h, (int, float)) and h > 0:
-                    heights.append(int(h))
 
     if heights:
         return f"{max(heights)}p"
@@ -74,6 +95,26 @@ def _extract_quality_label(info: Dict[str, Any]) -> str:
 
     return "unknown"
 
+
+def _max_height(info: Dict[str, Any]) -> int:
+    heights = []
+
+    direct_height = info.get("height")
+    if isinstance(direct_height, (int, float)) and direct_height > 0:
+        heights.append(int(direct_height))
+
+    for key in ("requested_formats", "formats", "requested_downloads"):
+        value = info.get(key)
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    h = item.get("height")
+                    if isinstance(h, (int, float)) and h > 0:
+                        heights.append(int(h))
+
+    return max(heights) if heights else 0
+
+
 def _safe_progress_callback(progress_callback, data: Dict[str, Any]):
     if not progress_callback:
         return
@@ -83,7 +124,79 @@ def _safe_progress_callback(progress_callback, data: Dict[str, Any]):
         pass
 
 
-async def download_track(track: Dict, progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None) -> Optional[Dict[str, Any]]:
+def _yt_headers() -> Dict[str, str]:
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+
+def _base_youtube_opts(output_template: str, progress_callback=None) -> Dict[str, Any]:
+    opts: Dict[str, Any] = {
+        "outtmpl": output_template,
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "windowsfilenames": True,
+        "nopart": False,
+        "continuedl": False,
+        "concurrent_fragment_downloads": max(1, YTDLP_CONCURRENT_FRAGMENTS),
+        "buffersize": 16 * 1024,
+        "socket_timeout": 30,
+        "retries": 10,
+        "fragment_retries": 10,
+        "extractor_retries": 3,
+        "file_access_retries": 3,
+        "skip_unavailable_fragments": True,
+        "source_address": "0.0.0.0",
+        "force_ipv4": True,
+        "http_headers": _yt_headers(),
+        "writethumbnail": False,
+        "writeinfojson": False,
+        "writesubtitles": False,
+        "writeautomaticsub": False,
+        "prefer_ffmpeg": True,
+        "merge_output_format": "mp4",
+        "extractor_args": {
+            "youtube": {
+                # Don't force a specific player client; some clients can limit available resolutions.
+                # Let yt-dlp pick the best available unless we need special overrides.
+                "skip": ["translated_subs"],
+                "player_skip": [],
+            }
+        },
+        "youtube_include_dash_manifest": True,
+        "youtube_include_hls_manifest": True,
+        "format_sort": [
+            "codec:h264",
+            "acodec:m4a",
+            "res",
+            "fps",
+            "size",
+        ],
+        "postprocessor_args": ["-threads", str(max(1, FFMPEG_THREADS))],
+        "progress_hooks": [lambda d: _safe_progress_callback(progress_callback, d)],
+    }
+
+    deno_path = os.getenv("YT_DENO_PATH", "").strip()
+    if deno_path:
+        opts["js_runtimes"] = {
+            "deno": {
+                "path": deno_path,
+            }
+        }
+
+    return opts
+
+
+async def download_track(
+    track: Dict,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Optional[Dict[str, Any]]:
     track["url"] = normalize_media_url(track.get("url", ""))
     if not track.get("url"):
         logger.error("No URL found for track: %s", track.get("id"))
@@ -108,6 +221,7 @@ async def download_track(track: Dict, progress_callback: Optional[Callable[[Dict
             "concurrent_fragment_downloads": max(1, YTDLP_CONCURRENT_FRAGMENTS),
             "postprocessor_args": ["-threads", str(max(1, FFMPEG_THREADS))],
             "progress_hooks": [lambda d: _safe_progress_callback(progress_callback, d)],
+            "prefer_ffmpeg": True,
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -132,12 +246,11 @@ async def download_track(track: Dict, progress_callback: Optional[Callable[[Dict
 
 async def get_youtube_video_info(url: str) -> Dict[str, Any]:
     url = normalize_media_url(url)
+
     def extract_info():
         ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
+            **_base_youtube_opts("%(title)s.%(ext)s"),
             "skip_download": True,
-            "noplaylist": True,
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -150,80 +263,270 @@ async def get_youtube_video_info(url: str) -> Dict[str, Any]:
                 "duration": duration,
                 "webpage_url": info.get("webpage_url") or url,
             }
+
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(YTDLP_EXECUTOR, extract_info)
 
 
-async def download_youtube_media(url: str, media_format: str, progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None) -> Optional[Dict[str, Any]]:
+def _is_video_only(fmt: Dict[str, Any]) -> bool:
+    return fmt.get("vcodec") not in (None, "", "none") and fmt.get("acodec") == "none"
+
+
+def _is_audio_only(fmt: Dict[str, Any]) -> bool:
+    return fmt.get("acodec") not in (None, "", "none") and fmt.get("vcodec") == "none"
+
+
+def _is_progressive(fmt: Dict[str, Any]) -> bool:
+    return fmt.get("vcodec") not in (None, "", "none") and fmt.get("acodec") not in (None, "", "none")
+
+
+def _video_sort_key(fmt: Dict[str, Any]) -> Tuple:
+    height = int(fmt.get("height") or 0)
+    fps = float(fmt.get("fps") or 0)
+    tbr = float(fmt.get("tbr") or 0)
+    ext = str(fmt.get("ext") or "")
+    vcodec = str(fmt.get("vcodec") or "")
+    is_h264 = 1 if vcodec.startswith("avc1") or "h264" in vcodec else 0
+    is_mp4 = 1 if ext == "mp4" else 0
+    return (height, is_h264, is_mp4, fps, tbr)
+
+
+def _audio_sort_key(fmt: Dict[str, Any]) -> Tuple:
+    abr = float(fmt.get("abr") or 0)
+    tbr = float(fmt.get("tbr") or 0)
+    ext = str(fmt.get("ext") or "")
+    acodec = str(fmt.get("acodec") or "")
+    is_m4a = 1 if ext in ("m4a", "mp4") else 0
+    is_aac = 1 if ("mp4a" in acodec or "aac" in acodec) else 0
+    return (is_m4a, is_aac, abr, tbr)
+
+
+def _build_video_profiles(formats: List[Dict[str, Any]], max_height: int) -> List[Tuple[str, str]]:
+    audio_only = [fmt for fmt in formats if _is_audio_only(fmt)]
+    video_only = [
+        fmt for fmt in formats
+        if _is_video_only(fmt) and int(fmt.get("height") or 0) > 0 and int(fmt.get("height") or 0) <= max_height
+    ]
+    progressive = [
+        fmt for fmt in formats
+        if _is_progressive(fmt) and int(fmt.get("height") or 0) > 0 and int(fmt.get("height") or 0) <= max_height
+    ]
+
+    audio_only.sort(key=_audio_sort_key, reverse=True)
+    video_only.sort(key=_video_sort_key, reverse=True)
+    progressive.sort(key=_video_sort_key, reverse=True)
+
+    profiles: List[Tuple[str, str]] = []
+    seen: set[str] = set()
+
+    top_audios = audio_only[:2]
+    top_videos = video_only[:8]
+    top_progressive = progressive[:4]
+
+    for vfmt in top_videos:
+        for afmt in top_audios:
+            fmt = f"{vfmt['format_id']}+{afmt['format_id']}"
+            if fmt not in seen:
+                profiles.append((f"dash_{vfmt.get('height')}_{vfmt['format_id']}_{afmt['format_id']}", fmt))
+                seen.add(fmt)
+
+    for pfmt in top_progressive:
+        fmt = str(pfmt["format_id"])
+        if fmt not in seen:
+            profiles.append((f"progressive_{pfmt.get('height')}_{pfmt['format_id']}", fmt))
+            seen.add(fmt)
+
+    return profiles
+
+
+def _ffprobe_streams(path: str) -> Dict[str, Any]:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-print_format",
+                "json",
+                "-show_streams",
+                "-show_format",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return json.loads(result.stdout)
+    except Exception as e:
+        logger.warning("ffprobe failed for %s: %s", path, e)
+        return {}
+
+
+def _needs_mobile_safe_transcode(path: str) -> bool:
+    meta = _ffprobe_streams(path)
+    streams = meta.get("streams", []) if isinstance(meta, dict) else []
+    fmt = meta.get("format", {}) if isinstance(meta, dict) else {}
+    container = str(fmt.get("format_name") or "")
+
+    video_codec = None
+    audio_codec = None
+    for stream in streams:
+        codec_type = stream.get("codec_type")
+        if codec_type == "video" and not video_codec:
+            video_codec = str(stream.get("codec_name") or "")
+        elif codec_type == "audio" and not audio_codec:
+            audio_codec = str(stream.get("codec_name") or "")
+
+    if "mp4" not in container and "mov" not in container:
+        return True
+    if video_codec not in ("h264",):
+        return True
+    if audio_codec not in ("aac", "mp3", "mp4a"):
+        return True
+    return False
+
+
+def _normalized_output_path(input_path: str) -> str:
+    base, _ = os.path.splitext(input_path)
+    return base + ".mobile.mp4"
+
+
+def _normalize_for_telegram(input_path: str, ffmpeg_threads: int) -> str:
+    output_path = _normalized_output_path(input_path)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        input_path,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-profile:v",
+        "high",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "160k",
+        "-threads",
+        str(max(1, ffmpeg_threads)),
+        output_path,
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
+    return output_path
+
+
+async def download_youtube_media(
+    url: str,
+    media_format: str,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Optional[Dict[str, Any]]:
     url = normalize_media_url(url)
     work_dir = tempfile.mkdtemp(prefix="yt_", dir=str(TEMP_DIR))
     output_template = os.path.join(work_dir, "%(title).180B [%(id)s].%(ext)s")
 
     def run_download():
         try:
-            info_opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True}
+            info_opts = {
+                **_base_youtube_opts(output_template),
+                "skip_download": True,
+            }
+
             with yt_dlp.YoutubeDL(info_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
 
             duration = int(info.get("duration") or 0)
-            long_video = SAFE_MODE_2GB and duration >= LONG_VIDEO_MINUTES * 60
-
-            base_opts = {
-                "outtmpl": output_template,
-                "quiet": True,
-                "no_warnings": True,
-                "noplaylist": True,
-                "windowsfilenames": True,
-                "concurrent_fragment_downloads": max(1, YTDLP_CONCURRENT_FRAGMENTS),
-                "nopart": True,
-                "writethumbnail": False,
-                "writeinfojson": False,
-                "writesubtitles": False,
-                "writeautomaticsub": False,
-                "progress_hooks": [lambda d: _safe_progress_callback(progress_callback, d)],
-                "postprocessor_args": ["-threads", str(max(1, FFMPEG_THREADS))],
-                "buffersize": 1024,
-                "http_chunk_size": 1048576,
-            }
+            formats = info.get("formats") or []
+            title = info.get("title") or "unknown title"
+            channel = info.get("channel") or info.get("uploader") or info.get("uploader_id") or "unknown channel"
+            webpage_url = info.get("webpage_url") or url
 
             if media_format == "mp3":
                 ydl_opts = {
-                    **base_opts,
-                    "format": "bestaudio[ext=m4a]/bestaudio/best",
+                    **_base_youtube_opts(output_template, progress_callback=progress_callback),
+                    "format": "bestaudio/best",
                     "postprocessors": [{
                         "key": "FFmpegExtractAudio",
                         "preferredcodec": "mp3",
                         "preferredquality": "192",
                     }],
                 }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info_result = ydl.extract_info(url, download=True)
+
             elif media_format == "mp4":
-                if long_video:
-                    ydl_opts = {
-                        **base_opts,
-                        "format": (
-                            f"bv*[height<={SAFE_LONG_VIDEO_MAX_HEIGHT}][ext=mp4]+ba[ext=m4a]/"
-                            f"bv*[height<={SAFE_LONG_VIDEO_MAX_HEIGHT}]+ba/"
-                            f"best[height<={SAFE_LONG_VIDEO_MAX_HEIGHT}][ext=mp4]/"
-                            f"best[height<={SAFE_LONG_VIDEO_MAX_HEIGHT}]"
-                        ),
-                        "merge_output_format": "mp4",
-                    }
-                else:
-                    ydl_opts = {
-                        **base_opts,
-                        "format": (
-                            "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/"
-                            "bv*[height<=1080]+ba/"
-                            "best[height<=1080][ext=mp4]/"
-                            "best[height<=1080]"
-                        ),
-                        "merge_output_format": "mp4",
-                    }
+                # Try to download the best possible video+audio combination.
+                # Prefer resolutions >= 720p, but if none are available, fall back to the best available.
+                all_heights = sorted(
+                    {
+                        int(f.get("height"))
+                        for f in formats
+                        if isinstance(f.get("height"), (int, float)) and int(f.get("height")) > 0
+                    },
+                    reverse=True,
+                )
+
+                if not all_heights:
+                    raise yt_dlp.utils.DownloadError("No suitable mp4 format found (no height information)")
+
+                preferred_heights = [h for h in all_heights if h >= 720]
+                fallback_heights = [h for h in all_heights if h < 720]
+
+                info_result = None
+                last_error: Optional[Exception] = None
+
+                for height in (preferred_heights or fallback_heights):
+                    # Try best available at this height, prefer mp4/m4a but allow webm/opus if needed.
+                    formats_to_try = [
+                        f"bestvideo[height<={height}]+bestaudio/best[height<={height}]",
+                        f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={height}]",
+                    ]
+
+                    for fmt in formats_to_try:
+                        try:
+                            logger.warning("Trying format selection (max height %s): %s", height, fmt)
+                            ydl_opts = {
+                                **_base_youtube_opts(output_template, progress_callback=progress_callback),
+                                "format": fmt,
+                            }
+                            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                                info_result = ydl.extract_info(url, download=True)
+                            break
+                        except Exception as e:
+                            last_error = e
+                            logger.warning("Format %s failed (height %s): %s", fmt, height, e)
+
+                    if info_result is not None:
+                        break
+
+                if info_result is None:
+                    if last_error:
+                        raise last_error
+                    raise yt_dlp.utils.DownloadError("No suitable mp4 format found")
+
+                logger.warning(
+                    "YouTube download selected format: %s height=%s resolution=%s",
+                    info_result.get("format"),
+                    info_result.get("height"),
+                    info_result.get("resolution"),
+                )
+
+                logger.warning(
+                    "YouTube download selected format: %s height=%s resolution=%s",
+                    info_result.get("format"),
+                    info_result.get("height"),
+                    info_result.get("resolution"),
+                )
             else:
                 raise ValueError(f"Unsupported media format: {media_format}")
-
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
 
             files = [
                 os.path.join(work_dir, name)
@@ -232,20 +535,43 @@ async def download_youtube_media(url: str, media_format: str, progress_callback:
             ]
             if not files:
                 return None
+
             files.sort(key=os.path.getmtime, reverse=True)
             final_file = files[0]
 
-            channel = info.get("channel") or info.get("uploader") or info.get("uploader_id") or "unknown channel"
-            title = info.get("title") or "unknown title"
-            duration = info.get("duration") or 0
+            if media_format == "mp4":
+                try:
+                    if _needs_mobile_safe_transcode(final_file):
+                        logger.warning("Normalizing video for Telegram/mobile playback: %s", final_file)
+                        normalized = _normalize_for_telegram(final_file, FFMPEG_THREADS)
+                        if os.path.exists(normalized):
+                            try:
+                                os.remove(final_file)
+                            except Exception:
+                                pass
+                            final_file = normalized
+                except Exception as e:
+                    logger.warning("Video normalization failed, keeping original file: %s", e)
+
+            file_meta = _ffprobe_streams(final_file)
+            width = None
+            height = None
+            for stream in file_meta.get("streams", []) if isinstance(file_meta, dict) else []:
+                if stream.get("codec_type") == "video":
+                    width = stream.get("width")
+                    height = stream.get("height")
+                    break
+
             return {
                 "file_path": final_file,
                 "work_dir": work_dir,
                 "channel": str(channel).strip().lower(),
                 "title": str(title).strip().lower(),
-                "duration": duration,
-                "webpage_url": info.get("webpage_url") or url,
-                "quality": _extract_quality_label(info) if media_format == "mp4" else None,
+                "duration": int(info_result.get("duration") or duration),
+                "webpage_url": info_result.get("webpage_url") or webpage_url,
+                "quality": _extract_quality_label(info_result) if media_format == "mp4" else None,
+                "width": width,
+                "height": height,
             }
         except Exception:
             shutil.rmtree(work_dir, ignore_errors=True)
@@ -259,21 +585,11 @@ async def download_youtube_media(url: str, media_format: str, progress_callback:
         return None
 
 
-def cleanup_files(track_id: str, compressed_file: Optional[str] = None):
-    for file_path in filter(None, [compressed_file]):
+def cleanup_files(track_id: str = "", compressed_file: Optional[str] = None, extra_file: Optional[str] = None):
+    for file_path in filter(None, [compressed_file, extra_file]):
         try:
             if os.path.exists(file_path):
                 os.remove(file_path)
                 logger.info("Cleaned up temp file: %s", file_path)
         except Exception as cleanup_error:
             logger.error("Error cleaning up temp file: %s", cleanup_error)
-
-
-def cleanup_temp_dir(path: Optional[str]):
-    if not path:
-        return
-    try:
-        shutil.rmtree(path, ignore_errors=True)
-        logger.info("Cleaned up temp dir: %s", path)
-    except Exception as e:
-        logger.error("Error cleaning temp dir %s: %s", path, e)

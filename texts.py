@@ -36,7 +36,7 @@ TEXTS = {
                         "`kennedyxoxo - statues` - конкретная песня",
 
         'playlist_prompt': "функция скачивания плейлистов в разработке",
-        'video_prompt': "отправь мне ссылку на youtube видео"
+        'video_prompt': "отправь мне ссылку на youtube/shorts видео"
                         "если будет плохое качество, попробуй скачать видео заново",
         'social_prompt': "функция поиска соц сетей в разработке",
         'lyrics_prompt': "функция поиска текстов в разработке",
@@ -100,7 +100,7 @@ TEXTS = {
                         "`kennedyxoxo - statues` - specific song",
 
         'playlist_prompt': "playlist download feature is in development",
-        'video_prompt': "send me a youtube video link\n"
+        'video_prompt': "send me a youtube/shorts video link\n"
                         "if you're video low quality, try downloading it again, should be good",
         'social_prompt': "social media search feature is in development",
         'lyrics_prompt': "lyrics search feature is in development",

@@ -4,7 +4,6 @@ import logging
 import os
 import subprocess
 import time
-from pathlib import Path
 
 from telegram import Bot, InputFile
 from telegram.error import RetryAfter
@@ -99,6 +98,7 @@ async def run_with_progress(bot, chat_id: int, user_id: int, media_format: str, 
         last_edit = 0.0
         last_percent_bucket = -1
         pending_item = None
+
         while True:
             try:
                 item = await asyncio.wait_for(queue.get(), timeout=1.0)
@@ -120,20 +120,30 @@ async def run_with_progress(bot, chat_id: int, user_id: int, media_format: str, 
 
             now = time.monotonic()
             text = format_progress_text(user_id, media_format, item)
-            percent = int(float(item.get("downloaded_bytes") or 0) * 100 / max(1, (item.get("total_bytes") or item.get("total_bytes_estimate") or 1))) if item.get("status") != "finished" else 100
+            percent = (
+                int(
+                    float(item.get("downloaded_bytes") or 0)
+                    * 100
+                    / max(1, (item.get("total_bytes") or item.get("total_bytes_estimate") or 1))
+                )
+                if item.get("status") != "finished"
+                else 100
+            )
+
             if text == last_text:
                 continue
             if item.get("status") != "finished" and percent == last_percent_bucket and now - last_edit < 10.0:
                 continue
-            # throttle edits to avoid Flood control.
             if now - last_edit < 5.0 and item.get("status") != "finished":
                 pending_item = item
                 continue
+
             pending_item = None
             last_text = text
             last_percent_bucket = percent
             last_edit = now
             await _safe_edit_message(progress_message, text)
+
             if item.get("status") == "finished":
                 break
 
@@ -151,7 +161,6 @@ async def send_done_with_back(bot, chat_id: int, user_id: int):
     user_states[user_id] = "done_wait_back"
 
 
-
 def check_ffmpeg() -> bool:
     try:
         subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
@@ -159,7 +168,6 @@ def check_ffmpeg() -> bool:
         return True
     except (subprocess.CalledProcessError, FileNotFoundError):
         return False
-
 
 
 def check_dependencies() -> bool:
@@ -196,8 +204,6 @@ async def _send_document_fallback(bot, chat_id, file_path, caption, parse_mode, 
             document.obj.close()
         except Exception:
             pass
-
-
 
 
 async def send_audio_safely(bot, chat_id, file_path, title, performer, duration, caption, parse_mode="HTML"):
@@ -250,7 +256,16 @@ async def send_audio_safely(bot, chat_id, file_path, title, performer, duration,
             pass
 
 
-async def send_video_safely(bot, chat_id, file_path, duration, caption, parse_mode="HTML"):
+async def send_video_safely(
+    bot,
+    chat_id,
+    file_path,
+    duration,
+    caption,
+    width=None,
+    height=None,
+    parse_mode="HTML",
+):
     video = _make_input_file(file_path)
     try:
         try:
@@ -258,6 +273,8 @@ async def send_video_safely(bot, chat_id, file_path, duration, caption, parse_mo
                 chat_id=chat_id,
                 video=video,
                 duration=duration,
+                width=width,
+                height=height,
                 caption=caption,
                 parse_mode=parse_mode,
                 supports_streaming=True,
@@ -274,6 +291,8 @@ async def send_video_safely(bot, chat_id, file_path, duration, caption, parse_mo
                     chat_id=chat_id,
                     video=video_retry,
                     duration=duration,
+                    width=width,
+                    height=height,
                     caption=caption,
                     parse_mode=parse_mode,
                     supports_streaming=True,
@@ -287,8 +306,8 @@ async def send_video_safely(bot, chat_id, file_path, duration, caption, parse_mo
                     video_retry.obj.close()
                 except Exception:
                     pass
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error("Failed to send video via send_video(): %s", e, exc_info=True)
 
         await _send_document_fallback(bot, chat_id, file_path, caption, parse_mode, 7200, 7200, 120)
     finally:
@@ -325,7 +344,12 @@ async def handle_track_download(track: dict, user_id: int, context: ContextTypes
         if file_size > MAX_FILE_SIZE:
             await context.bot.send_message(chat_id=user_id, text=get_text(user_id, "compressing"))
             loop = asyncio.get_running_loop()
-            compressed_file = await loop.run_in_executor(PROCESS_EXECUTOR, compress_audio_file, downloaded_file, TARGET_SIZE_MB)
+            compressed_file = await loop.run_in_executor(
+                PROCESS_EXECUTOR,
+                compress_audio_file,
+                downloaded_file,
+                TARGET_SIZE_MB,
+            )
             if not compressed_file or not os.path.exists(compressed_file):
                 await context.bot.send_message(chat_id=user_id, text=get_text(user_id, "compression_failed"))
                 return
@@ -402,13 +426,18 @@ class YouTubeDownloadQueue:
         work_dir = None
         compressed_file = None
         progress_message = None
+
         try:
             result, progress_message = await run_with_progress(
                 bot,
                 user_id,
                 user_id,
                 media_format,
-                lambda progress_callback: download_youtube_media(url, media_format, progress_callback=progress_callback),
+                lambda progress_callback: download_youtube_media(
+                    url,
+                    media_format,
+                    progress_callback=progress_callback,
+                ),
             )
             if not result:
                 await bot.send_message(chat_id=user_id, text=get_text(user_id, "youtube_download_error"))
@@ -421,13 +450,20 @@ class YouTubeDownloadQueue:
             duration = result["duration"]
             webpage_url = result["webpage_url"]
             quality = result.get("quality")
+            width = result.get("width")
+            height = result.get("height")
             file_size = os.path.getsize(file_path)
             send_path = file_path
 
             if media_format == "mp3" and file_size > MAX_FILE_SIZE:
                 await bot.send_message(chat_id=user_id, text=get_text(user_id, "queue_mp3_compressing"))
                 loop = asyncio.get_running_loop()
-                compressed_file = await loop.run_in_executor(PROCESS_EXECUTOR, compress_audio_file, file_path, TARGET_SIZE_MB)
+                compressed_file = await loop.run_in_executor(
+                    PROCESS_EXECUTOR,
+                    compress_audio_file,
+                    file_path,
+                    TARGET_SIZE_MB,
+                )
                 if not compressed_file or not os.path.exists(compressed_file):
                     await bot.send_message(chat_id=user_id, text=get_text(user_id, "queue_mp3_compress_failed"))
                     return
@@ -440,23 +476,12 @@ class YouTubeDownloadQueue:
                 await bot.send_message(chat_id=user_id, text=get_text(user_id, "queue_mp4_too_large"))
                 return
 
-            quality_line = ""
-            if quality:
-                lang = get_text(user_id, "youtube_link")  # просто чтобы получить язык
-                if "youtube" in lang.lower():
-                    # EN
-                    quality_line = f"\nquality: {quality}"
-                else:
-                    # RU
-                    quality_line = f"\nкачество: {quality}"
-
             if media_format == "mp3":
                 caption = (
-                f'{channel} - {title}\n'
-                f'<a href="{webpage_url}">{get_text(user_id, "youtube_link")}</a>\n'
-                '@musicshithead_bot'
-            )
-                
+                    f'{channel} - {title}\n'
+                    f'<a href="{webpage_url}">{get_text(user_id, "youtube_link")}</a>\n'
+                    '@musicshithead_bot'
+                )
                 await send_audio_safely(
                     bot=bot,
                     chat_id=user_id,
@@ -486,6 +511,8 @@ class YouTubeDownloadQueue:
                     file_path=send_path,
                     duration=duration,
                     caption=caption,
+                    width=width,
+                    height=height,
                 )
 
             try:
@@ -493,7 +520,9 @@ class YouTubeDownloadQueue:
                     await progress_message.delete()
             except Exception:
                 pass
+
             await send_done_with_back(bot, user_id, user_id)
+
         except Exception as e:
             logger.error("YouTube processing error for user %s: %s", user_id, e, exc_info=True)
             await bot.send_message(chat_id=user_id, text=get_text(user_id, "youtube_download_error"))
