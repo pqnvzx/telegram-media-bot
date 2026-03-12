@@ -21,6 +21,7 @@ TEXTS = {
         'no_results': "не нашел, попробуй что-то другое",
 
         'error': "ошибка: {error}",
+        'retry': "попробовать заново",
         'download_error': "ошибка при скачивании",
         'in_development': "функция в разработке",
 
@@ -39,7 +40,14 @@ TEXTS = {
         'video_prompt': "отправь мне ссылку на youtube/shorts видео"
                         "если будет плохое качество, попробуй скачать видео заново",
         'social_prompt': "функция поиска соц сетей в разработке",
-        'lyrics_prompt': "функция поиска текстов в разработке",
+        'lyrics_prompt': "введите исполнителя или исполнителя и песню в формате: исполнитель - трек",
+        'lyrics_search_artist': "ищу треки {artist}",
+        'lyrics_tracks_found': "найдено {total} треков. страница {current}/{total_pages}.",
+        'lyrics_select_match': "выбери наиболее подходящий вариант ({current}/{total_pages}):",
+        'lyrics_not_found': "не удалось найти текст",
+        'lyrics_no_token': "для поиска текста нужен GENIUS_ACCESS_TOKEN в .env",
+        'lyrics_done': "",
+        'lyrics_more_artist': "другие песни артиста",
 
         'invalid_youtube_link': "отправь корректную ссылку на youtube видео",
         'video_format_prompt': "выбери формат для скачивания",
@@ -85,6 +93,7 @@ TEXTS = {
         'no_results': "couldn't find anything, try something else",
 
         'error': "error: {error}",
+        'retry': "try again",
         'download_error': "download error",
         'in_development': "feature in development",
 
@@ -103,7 +112,14 @@ TEXTS = {
         'video_prompt': "send me a youtube/shorts video link\n"
                         "if you're video low quality, try downloading it again, should be good",
         'social_prompt': "social media search feature is in development",
-        'lyrics_prompt': "lyrics search feature is in development",
+        'lyrics_prompt': "enter artist or artist - song",
+        'lyrics_search_artist': "searching for tracks by {artist}",
+        'lyrics_tracks_found': "found {total} tracks. page {current}/{total_pages}.",
+        'lyrics_select_match': "choose the best match ({current}/{total_pages}):",
+        'lyrics_not_found': "couldn't find lyrics",
+        'lyrics_no_token': "lyrics search requires GENIUS_ACCESS_TOKEN in .env",
+        'lyrics_done': "",
+        'lyrics_more_artist': "more songs by artist",
 
         'invalid_youtube_link': "send a valid youtube video link",
         'video_format_prompt': "choose download format",

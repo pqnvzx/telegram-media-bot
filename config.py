@@ -33,6 +33,8 @@ if not SOUNDCLOUD_CLIENT_SECRET:
 # 'video' - режим видео
 # 'social' - режим соц сетей
 # 'lyrics' - режим текста
+LYRICS_STATE = "lyrics"
+
 TEMP_DIR = Path(os.getenv("TEMP_DIR", str(BASE_DIR / "temp"))).resolve()
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 

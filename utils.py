@@ -455,6 +455,10 @@ class YouTubeDownloadQueue:
             file_size = os.path.getsize(file_path)
             send_path = file_path
 
+            logger.info(
+                "Downloaded video file: %s size=%s width=%s height=%s", file_path, file_size, width, height
+            )
+
             if media_format == "mp3" and file_size > MAX_FILE_SIZE:
                 await bot.send_message(chat_id=user_id, text=get_text(user_id, "queue_mp3_compressing"))
                 loop = asyncio.get_running_loop()
@@ -482,6 +486,7 @@ class YouTubeDownloadQueue:
                     f'<a href="{webpage_url}">{get_text(user_id, "youtube_link")}</a>\n'
                     '@musicshithead_bot'
                 )
+                logger.info("Sending audio to user %s: %s", user_id, send_path)
                 await send_audio_safely(
                     bot=bot,
                     chat_id=user_id,
@@ -491,6 +496,7 @@ class YouTubeDownloadQueue:
                     duration=duration,
                     caption=caption,
                 )
+                logger.info("Sent audio to user %s: %s", user_id, send_path)
             else:
                 quality_text = ""
                 if quality:
@@ -505,6 +511,7 @@ class YouTubeDownloadQueue:
                     f'<a href="{webpage_url}">{get_text(user_id, "youtube_link")}</a>\n'
                     "@musicshithead_bot"
                 )
+                logger.info("Sending video to user %s: %s", user_id, send_path)
                 await send_video_safely(
                     bot=bot,
                     chat_id=user_id,
@@ -514,6 +521,7 @@ class YouTubeDownloadQueue:
                     width=width,
                     height=height,
                 )
+                logger.info("Sent video to user %s: %s", user_id, send_path)
 
             try:
                 if progress_message:

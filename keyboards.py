@@ -8,7 +8,8 @@ async def create_track_keyboard(
     tracks: List[Dict],
     page: int = 0,
     items_per_page: int = 8,
-    user_id: int = None
+    user_id: int = None,
+    callback_prefix: str = "track",
 ) -> Tuple[InlineKeyboardMarkup, int]:
     total_pages = (len(tracks) + items_per_page - 1) // items_per_page
     start_idx = page * items_per_page
@@ -22,7 +23,7 @@ async def create_track_keyboard(
             display_name = display_name[:42] + "..."
         duration = f"{track['duration'] // 60:02}:{track['duration'] % 60:02}"
         button_text = f"{display_name} [{duration}]"
-        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"track_{i}")])
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"{callback_prefix}_{i}")])
 
     nav_buttons = []
     if page > 0:
@@ -70,3 +71,8 @@ def get_video_format_keyboard() -> InlineKeyboardMarkup:
         InlineKeyboardButton("MP4", callback_data="video_mp4"),
     ]]
     return InlineKeyboardMarkup(keyboard)
+
+def get_retry_button(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(get_text(user_id, "retry"), callback_data="retry_state")
+    ]])

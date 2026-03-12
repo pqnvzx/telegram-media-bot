@@ -135,7 +135,11 @@ def _yt_headers() -> Dict[str, str]:
     }
 
 
-def _base_youtube_opts(output_template: str, progress_callback=None) -> Dict[str, Any]:
+def _base_youtube_opts(
+    output_template: str,
+    progress_callback=None,
+    use_external_downloader: bool = True,
+) -> Dict[str, Any]:
     opts: Dict[str, Any] = {
         "outtmpl": output_template,
         "quiet": True,
@@ -189,6 +193,28 @@ def _base_youtube_opts(output_template: str, progress_callback=None) -> Dict[str
                 "path": deno_path,
             }
         }
+
+    if use_external_downloader:
+        external_dl = os.getenv("YTDLP_EXTERNAL_DOWNLOADER", "").strip()
+        if external_dl:
+            opts["external_downloader"] = external_dl
+            env_args = os.getenv("YTDLP_EXTERNAL_DOWNLOADER_ARGS", "").strip()
+            if env_args:
+                opts["external_downloader_args"] = env_args.split()
+            elif external_dl == "aria2c":
+                opts["external_downloader_args"] = [
+                    "-x",
+                    "16",
+                    "-s",
+                    "16",
+                    "--max-connection-per-server=16",
+                    "--file-allocation=none",
+                ]
+            logger.info(
+                "Enabled external downloader %s %s",
+                external_dl,
+                opts.get("external_downloader_args"),
+            )
 
     return opts
 
@@ -249,7 +275,7 @@ async def get_youtube_video_info(url: str) -> Dict[str, Any]:
 
     def extract_info():
         ydl_opts = {
-            **_base_youtube_opts("%(title)s.%(ext)s"),
+            **_base_youtube_opts("%(title)s.%(ext)s", use_external_downloader=False),
             "skip_download": True,
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -435,6 +461,7 @@ async def download_youtube_media(
 
     def run_download():
         try:
+            logger.info("Starting YouTube download: url=%s format=%s", url, media_format)
             info_opts = {
                 **_base_youtube_opts(output_template),
                 "skip_download": True,
@@ -449,9 +476,36 @@ async def download_youtube_media(
             channel = info.get("channel") or info.get("uploader") or info.get("uploader_id") or "unknown channel"
             webpage_url = info.get("webpage_url") or url
 
+            logger.info(
+                "YouTube info: title=%s channel=%s duration=%s formats=%s",
+                title,
+                channel,
+                duration,
+                len(formats),
+            )
+
+            # Determine whether to use an external downloader (aria2c/etc).
+            # This is enabled via YTDLP_EXTERNAL_DOWNLOADER and can be tuned with
+            # YTDLP_EXTERNAL_DOWNLOADER_MODE:
+            #   - always: always use external downloader
+            #   - auto: use only for large downloads (default)
+            #   - never: never use external downloader
+            external_mode = os.getenv("YTDLP_EXTERNAL_DOWNLOADER_MODE", "auto").strip().lower()
+            use_external_downloader = False
+            if os.getenv("YTDLP_EXTERNAL_DOWNLOADER", "").strip():
+                if external_mode == "always":
+                    use_external_downloader = True
+                elif external_mode == "auto":
+                    size = int(info.get("filesize") or info.get("filesize_approx") or 0)
+                    use_external_downloader = size >= 80 * 1024 * 1024
+
             if media_format == "mp3":
                 ydl_opts = {
-                    **_base_youtube_opts(output_template, progress_callback=progress_callback),
+                    **_base_youtube_opts(
+                        output_template,
+                        progress_callback=progress_callback,
+                        use_external_downloader=use_external_downloader,
+                    ),
                     "format": "bestaudio/best",
                     "postprocessors": [{
                         "key": "FFmpegExtractAudio",
@@ -463,63 +517,24 @@ async def download_youtube_media(
                     info_result = ydl.extract_info(url, download=True)
 
             elif media_format == "mp4":
-                # Try to download the best possible video+audio combination.
-                # Prefer resolutions >= 720p, but if none are available, fall back to the best available.
-                all_heights = sorted(
-                    {
-                        int(f.get("height"))
-                        for f in formats
-                        if isinstance(f.get("height"), (int, float)) and int(f.get("height")) > 0
-                    },
-                    reverse=True,
+                # Download best available MP4-compatible stream, prioritizing >=720p.
+                # If >=720p isn't available, fall back to the best available stream.
+                fmt = (
+                    "bestvideo[height>=720]+bestaudio/best[height>=720]/"
+                    "bestvideo+bestaudio/best"
                 )
+                ydl_opts = {
+                    **_base_youtube_opts(
+                        output_template,
+                        progress_callback=progress_callback,
+                        use_external_downloader=use_external_downloader,
+                    ),
+                    "format": fmt,
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info_result = ydl.extract_info(url, download=True)
 
-                if not all_heights:
-                    raise yt_dlp.utils.DownloadError("No suitable mp4 format found (no height information)")
-
-                preferred_heights = [h for h in all_heights if h >= 720]
-                fallback_heights = [h for h in all_heights if h < 720]
-
-                info_result = None
-                last_error: Optional[Exception] = None
-
-                for height in (preferred_heights or fallback_heights):
-                    # Try best available at this height, prefer mp4/m4a but allow webm/opus if needed.
-                    formats_to_try = [
-                        f"bestvideo[height<={height}]+bestaudio/best[height<={height}]",
-                        f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={height}]",
-                    ]
-
-                    for fmt in formats_to_try:
-                        try:
-                            logger.warning("Trying format selection (max height %s): %s", height, fmt)
-                            ydl_opts = {
-                                **_base_youtube_opts(output_template, progress_callback=progress_callback),
-                                "format": fmt,
-                            }
-                            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                                info_result = ydl.extract_info(url, download=True)
-                            break
-                        except Exception as e:
-                            last_error = e
-                            logger.warning("Format %s failed (height %s): %s", fmt, height, e)
-
-                    if info_result is not None:
-                        break
-
-                if info_result is None:
-                    if last_error:
-                        raise last_error
-                    raise yt_dlp.utils.DownloadError("No suitable mp4 format found")
-
-                logger.warning(
-                    "YouTube download selected format: %s height=%s resolution=%s",
-                    info_result.get("format"),
-                    info_result.get("height"),
-                    info_result.get("resolution"),
-                )
-
-                logger.warning(
+                logger.info(
                     "YouTube download selected format: %s height=%s resolution=%s",
                     info_result.get("format"),
                     info_result.get("height"),
@@ -538,29 +553,27 @@ async def download_youtube_media(
 
             files.sort(key=os.path.getmtime, reverse=True)
             final_file = files[0]
+            width = info_result.get("width")
+            height = info_result.get("height")
 
-            if media_format == "mp4":
-                try:
-                    if _needs_mobile_safe_transcode(final_file):
-                        logger.warning("Normalizing video for Telegram/mobile playback: %s", final_file)
-                        normalized = _normalize_for_telegram(final_file, FFMPEG_THREADS)
-                        if os.path.exists(normalized):
-                            try:
-                                os.remove(final_file)
-                            except Exception:
-                                pass
-                            final_file = normalized
-                except Exception as e:
-                    logger.warning("Video normalization failed, keeping original file: %s", e)
+            # Fallback to ffprobe if dimensions aren't provided by yt-dlp.
+            if width is None or height is None:
+                file_meta = _ffprobe_streams(final_file)
+                width = None
+                height = None
+                for stream in file_meta.get("streams", []) if isinstance(file_meta, dict) else []:
+                    if stream.get("codec_type") == "video":
+                        width = stream.get("width")
+                        height = stream.get("height")
+                        break
 
-            file_meta = _ffprobe_streams(final_file)
-            width = None
-            height = None
-            for stream in file_meta.get("streams", []) if isinstance(file_meta, dict) else []:
-                if stream.get("codec_type") == "video":
-                    width = stream.get("width")
-                    height = stream.get("height")
-                    break
+            logger.info(
+                "YouTube download finished: file=%s size=%s width=%s height=%s",
+                final_file,
+                os.path.getsize(final_file),
+                width,
+                height,
+            )
 
             return {
                 "file_path": final_file,
