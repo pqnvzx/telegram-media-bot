@@ -414,6 +414,33 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await handle_track_download(track, user_id, context)
             return
 
+        if data.startswith("page_"):
+            if user_states.get(user_id) != "music":
+                return
+
+            try:
+                page = int(data.split("_")[1])
+            except (IndexError, ValueError):
+                return
+
+            tracks = context.user_data.get("search_results", [])
+            if not tracks:
+                return
+
+            keyboard, total_pages = await create_track_keyboard(tracks, page, user_id=user_id)
+            context.user_data["current_page"] = page
+            await query.edit_message_text(
+                text=get_text(
+                    user_id,
+                    "tracks_found",
+                    total=len(tracks),
+                    current=page + 1,
+                    total_pages=total_pages,
+                ),
+                reply_markup=keyboard,
+            )
+            return
+
         if data.startswith("lyrics_track_"):
             if user_states.get(user_id) != LYRICS_STATE:
                 return
